@@ -1,0 +1,562 @@
+#!/usr/bin/env zsh
+# wt — git worktree manager
+#
+# A small zsh tool for the "bare repo + sibling worktrees" layout: one clone,
+# many checked-out branches living side by side as directories.  See the README.
+#
+# Subcommands that move you into a worktree (clone/add/save/cd/pr) can't change
+# the calling shell's directory from a child process, so they emit the target
+# directory on file descriptor 3.  Install the shell wrapper to make that cd
+# happen automatically:
+#
+#     eval "$(wt shell-init)"   # add to ~/.zshrc (or ~/.bashrc)
+#
+# Without the wrapper the command still works — it just prints where it would
+# have moved you.  For scripts and agents, `wt path <branch>` prints a worktree's
+# absolute path on stdout, so `cd "$(wt path my-branch)"` always works.
+
+# ─── colors ────────────────────────────────────────────────────────────────────
+
+_WT_BOLD=$'\033[1m'
+_WT_DIM=$'\033[2m'
+_WT_RED=$'\033[31m'
+_WT_GREEN=$'\033[32m'
+_WT_YELLOW=$'\033[33m'
+_WT_CYAN=$'\033[36m'
+_WT_RESET=$'\033[0m'
+
+# ─── internal helpers ──────────────────────────────────────────────────────────
+
+_wt_err()  { printf "${_WT_RED}error:${_WT_RESET} %s\n" "$*" >&2; }
+_wt_info() { printf "  ${_WT_DIM}%s${_WT_RESET}\n" "$*" >&2; }
+_wt_ok()   { printf "  ${_WT_GREEN}%s${_WT_RESET}\n" "$*" >&2; }
+
+# Hand a destination directory to the `wt` shell wrapper via fd 3 so it can cd
+# there.  When run without the wrapper (fd 3 closed) we print a hint instead.
+_wt_emit_cd() {
+  if { true >&3 } 2>/dev/null; then
+    printf '%s' "$1" >&3
+  else
+    _wt_info "would cd to: $1  (run 'eval \"\$(wt shell-init)\"' to enable auto-cd)"
+  fi
+}
+
+# Resolve the container root (parent of .bare) from anywhere in the tree.
+# Works from inside any worktree or from the container itself.
+_wt_root() {
+  local common gitdir
+
+  # Prefer --path-format=absolute (git >= 2.32)
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+
+  if [[ -z "$common" ]]; then
+    gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null) || {
+      _wt_err "not inside a git repository"
+      return 1
+    }
+    # Worktree gitdirs contain a 'commondir' file pointing to the shared gitdir
+    if [[ -f "$gitdir/commondir" ]]; then
+      local rel
+      rel=$(< "$gitdir/commondir")
+      common=$(cd "$gitdir/$rel" 2>/dev/null && pwd) || {
+        _wt_err "could not resolve commondir"
+        return 1
+      }
+    else
+      common="$gitdir"
+    fi
+  fi
+
+  local root
+  root=$(dirname "$common")
+  if [[ ! -d "$root/.bare" ]]; then
+    _wt_err "not a wt-managed repository (no .bare found)"
+    return 1
+  fi
+  printf '%s' "$root"
+}
+
+# Convert a branch name to a safe directory name (/ -> -).
+# Note: this can collide (feat/foo and feat-foo both map to feat-foo); in
+# practice branch names rarely clash this way.
+_wt_dir() { printf '%s' "${1//\//-}"; }
+
+# ─── wt clone ──────────────────────────────────────────────────────────────────
+
+_wt_clone() {
+  [[ $# -eq 0 ]] && { _wt_err "usage: wt clone <url> [dir]"; return 1; }
+
+  local url="$1"
+  local dir="${2:-$(basename "$url" .git)}"
+
+  printf "\n${_WT_BOLD}Cloning${_WT_RESET} %s\n" "$url" >&2
+
+  mkdir -p "$dir" || { _wt_err "could not create: $dir"; return 1; }
+  git clone --bare "$url" "$dir/.bare" || return 1
+  printf 'gitdir: ./.bare\n' > "$dir/.git"
+
+  # Bare clones don't configure remote tracking refs by default; fix that.
+  git -C "$dir/.bare" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+
+  _wt_info "Fetching..."
+  git -C "$dir" fetch --quiet
+
+  local default
+  default=$(git -C "$dir/.bare" symbolic-ref --short HEAD 2>/dev/null) || default="main"
+
+  _wt_info "Creating worktree for '$default'..."
+  git -C "$dir" worktree add "$default" "$default" || return 1
+
+  _wt_ok "Ready."
+  local dest
+  dest=$(cd "$dir/$default" 2>/dev/null && pwd) || dest="$dir/$default"
+  _wt_emit_cd "$dest"
+}
+
+# ─── wt add-fork ───────────────────────────────────────────────────────────────
+
+_wt_add_fork() {
+  [[ $# -eq 0 ]] && { _wt_err "usage: wt add-fork <url>"; return 1; }
+
+  local url="$1"
+  local root
+  root=$(_wt_root) || return 1
+
+  git -C "$root" remote get-url origin &>/dev/null || {
+    _wt_err "no 'origin' remote found to rename"
+    return 1
+  }
+
+  local default
+  default=$(git -C "$root/.bare" symbolic-ref --short HEAD 2>/dev/null) || default="main"
+
+  _wt_info "Renaming origin -> upstream..."
+  git -C "$root" remote rename origin upstream
+
+  _wt_info "Adding fork as origin..."
+  git -C "$root" remote add origin "$url"
+
+  # Point the default branch at upstream so `git pull` does the right thing
+  _wt_info "Setting '$default' to track upstream/$default..."
+  git -C "$root" branch --set-upstream-to="upstream/$default" "$default" 2>/dev/null || true
+
+  _wt_info "Fetching origin..."
+  git -C "$root" fetch origin --quiet
+
+  _wt_ok "Done.  '$default' pulls from upstream,  pushes go to origin."
+}
+
+# ─── shared-artifact cloning ───────────────────────────────────────────────────
+
+# APFS-clone node_modules and .env* files from src worktree into dst worktree.
+# Uses `cp -c` (clonefile), which is macOS/APFS-only; on other filesystems the
+# clone silently fails and we skip rather than doing a slow deep copy.
+_wt_clone_shared() {
+  local src="$1" dst="$2"
+  local cloned=0 f name
+
+  if [[ -d "$src/node_modules" && ! -e "$dst/node_modules" ]]; then
+    _wt_info "Cloning node_modules..."
+    if cp -cR "$src/node_modules" "$dst/node_modules" 2>/dev/null; then
+      (( cloned++ ))
+    else
+      _wt_info "  (APFS clone unavailable, skipping node_modules)"
+    fi
+  fi
+
+  for f in "$src"/.env*(N); do
+    name="${f##*/}"
+    [[ -e "$dst/$name" ]] && continue
+    _wt_info "Cloning $name..."
+    if [[ -d "$f" ]]; then
+      cp -cR "$f" "$dst/$name" 2>/dev/null && (( cloned++ )) || true
+    else
+      cp -c  "$f" "$dst/$name" 2>/dev/null && (( cloned++ )) || true
+    fi
+  done
+
+  (( cloned > 0 )) && _wt_ok "Cloned $cloned item(s) from ${src##*/}/"
+  return 0
+}
+
+# Find the first sibling worktree that has node_modules or .env* files and clone from it.
+_wt_maybe_clone_shared() {
+  local root="$1" dst="$2"
+  local candidate clone_src=""
+
+  for candidate in "$root"/*(/N); do
+    [[ "${candidate%/}" == "${dst%/}" ]] && continue
+    local _env=("$candidate"/.env*(N))
+    if [[ -d "$candidate/node_modules" || ${#_env[@]} -gt 0 ]]; then
+      clone_src="$candidate"
+      break
+    fi
+  done
+
+  [[ -n "$clone_src" ]] && _wt_clone_shared "$clone_src" "$dst"
+  return 0
+}
+
+# ─── wt add ────────────────────────────────────────────────────────────────────
+
+_wt_add() {
+  [[ $# -eq 0 ]] && { _wt_err "usage: wt add <branch> [base]"; return 1; }
+
+  local branch="$1" base="$2"
+  local root
+  root=$(_wt_root) || return 1
+
+  local dir_name worktree_path
+  dir_name=$(_wt_dir "$branch")
+  worktree_path="$root/$dir_name"
+
+  [[ -d "$worktree_path" ]] && { _wt_err "directory already exists: $worktree_path"; return 1; }
+
+  # Branch already exists locally — just add a worktree for it
+  if git -C "$root" rev-parse --verify "$branch" &>/dev/null; then
+    _wt_info "Checking out existing branch '$branch'..."
+    git -C "$root" worktree add "$worktree_path" "$branch" || return 1
+    _wt_maybe_clone_shared "$root" "$worktree_path"
+    _wt_emit_cd "$worktree_path"
+    return
+  fi
+
+  # Discover which remotes carry this branch
+  local has_upstream="" has_origin=""
+  git -C "$root" rev-parse --verify "upstream/$branch" &>/dev/null && has_upstream=1
+  git -C "$root" rev-parse --verify "origin/$branch"   &>/dev/null && has_origin=1
+
+  local tracking_remote=""
+
+  if [[ -n "$has_upstream" && -n "$has_origin" ]]; then
+    printf "\n  ${_WT_YELLOW}Branch exists on both remotes. Which should it track?${_WT_RESET}\n" >&2
+    printf "    ${_WT_CYAN}[1]${_WT_RESET} upstream/%s\n" "$branch" >&2
+    printf "    ${_WT_CYAN}[2]${_WT_RESET} origin/%s\n"   "$branch" >&2
+    printf "  Choice: " >&2
+    local choice; read -r -k1 choice; echo >&2
+    case "$choice" in
+      1) tracking_remote="upstream" ;;
+      2) tracking_remote="origin"   ;;
+      *) _wt_err "invalid choice"; return 1 ;;
+    esac
+  elif [[ -n "$has_upstream" ]]; then
+    tracking_remote="upstream"
+  elif [[ -n "$has_origin" ]]; then
+    tracking_remote="origin"
+  fi
+
+  if [[ -n "$tracking_remote" ]]; then
+    _wt_info "Tracking $tracking_remote/$branch..."
+    git -C "$root" worktree add --track -b "$branch" "$worktree_path" "$tracking_remote/$branch" || return 1
+  else
+    # Fork off the branch currently checked out where the command was run,
+    # unless an explicit base was given.  `git rev-parse HEAD` resolves in the
+    # caller's cwd (not -C "$root"), so we get the current worktree's tip.
+    local start
+    if [[ -n "$base" ]]; then
+      start="$base"
+    else
+      start=$(git rev-parse --verify HEAD 2>/dev/null) || start="HEAD"
+    fi
+    _wt_info "Creating new branch from ${base:-current HEAD}..."
+    git -C "$root" worktree add -b "$branch" "$worktree_path" "$start" || return 1
+  fi
+
+  _wt_maybe_clone_shared "$root" "$worktree_path"
+  _wt_emit_cd "$worktree_path"
+}
+
+# ─── wt save ───────────────────────────────────────────────────────────────────
+
+_wt_save() {
+  [[ $# -eq 0 ]] && { _wt_err "usage: wt save <branch>"; return 1; }
+
+  local branch="$1"
+  local root
+  root=$(_wt_root) || return 1
+
+  local dir_name worktree_path
+  dir_name=$(_wt_dir "$branch")
+  worktree_path="$root/$dir_name"
+
+  [[ -d "$worktree_path" ]] && { _wt_err "directory already exists: $worktree_path"; return 1; }
+
+  if [[ -z "$(git status --porcelain 2>/dev/null)" ]]; then
+    _wt_err "no local changes to save; use 'wt add $branch' to create an empty branch"
+    return 1
+  fi
+
+  # Capture the current tip *before* stashing so the new branch forks from the
+  # commit these changes were built on (clean stash pop), not the default branch.
+  local start
+  start=$(git rev-parse --verify HEAD 2>/dev/null) || { _wt_err "could not resolve current HEAD"; return 1; }
+
+  # -u includes untracked files so new files come along too
+  _wt_info "Stashing changes..."
+  git stash -u || return 1
+
+  _wt_info "Creating worktree '$branch'..."
+  if ! git -C "$root" worktree add -b "$branch" "$worktree_path" "$start"; then
+    _wt_err "worktree creation failed; restoring stash"
+    git stash pop
+    return 1
+  fi
+
+  _wt_maybe_clone_shared "$root" "$worktree_path"
+
+  _wt_info "Applying stash..."
+  if ! git -C "$worktree_path" stash pop; then
+    _wt_err "stash pop failed; run 'git stash pop' in $dir_name/ manually"
+    _wt_emit_cd "$worktree_path"
+    return 1
+  fi
+
+  _wt_emit_cd "$worktree_path"
+}
+
+# ─── wt rm ─────────────────────────────────────────────────────────────────────
+
+_wt_rm() {
+  [[ $# -eq 0 ]] && { _wt_err "usage: wt rm <branch> [-d|-D]"; return 1; }
+
+  local branch="$1" flag="${2:-}"
+  local root
+  root=$(_wt_root) || return 1
+
+  local dir_name worktree_path
+  dir_name=$(_wt_dir "$branch")
+  worktree_path="$root/$dir_name"
+
+  # Guard: refuse to remove the worktree you're currently inside
+  if [[ -d "$worktree_path" ]]; then
+    local resolved_wt current
+    resolved_wt=$(cd "$worktree_path" && pwd -P)
+    current=$(pwd -P)
+    if [[ "$current" == "$resolved_wt" || "$current" == "$resolved_wt/"* ]]; then
+      _wt_err "cannot remove the worktree you are currently inside"
+      return 1
+    fi
+  fi
+
+  git -C "$root" worktree remove "$dir_name" || return 1
+
+  case "$flag" in
+    -d) git -C "$root" branch -d "$branch" ;;
+    -D) git -C "$root" branch -D "$branch" ;;
+  esac
+
+  _wt_ok "Removed $dir_name/"
+}
+
+# ─── wt ls ─────────────────────────────────────────────────────────────────────
+
+_wt_ls_entry() {
+  local root="$1" current="$2" path="$3" hash="$4" branch="$5"
+  [[ -n "$path" && -n "$branch" ]] || return
+  local rel resolved
+  rel="${path#$root/}"
+  [[ "$rel" == "$path" ]] && rel="."
+  resolved=$(cd "$path" 2>/dev/null && pwd -P || echo "$path")
+  if [[ "$resolved" == "$current" || "$resolved" == "$current/"* ]]; then
+    printf "  ${_WT_GREEN}* %-28s${_WT_RESET} ${_WT_DIM}%s${_WT_RESET}  %s\n" \
+      "$branch" "$hash" "$rel"
+  else
+    printf "    ${_WT_CYAN}%-28s${_WT_RESET} ${_WT_DIM}%s  %s${_WT_RESET}\n" \
+      "$branch" "$hash" "$rel"
+  fi
+}
+
+_wt_ls() {
+  local root
+  root=$(_wt_root) || return 1
+
+  local current
+  current=$(pwd -P 2>/dev/null || pwd)
+
+  # Capture git output in normal shell context (not inside a process substitution),
+  # which avoids PATH/alias issues that can affect forked subprocesses on some systems.
+  local raw
+  raw=$(git -C "$root" worktree list --porcelain) || return 1
+
+  echo
+  printf "  ${_WT_BOLD}%-30s %-9s %s${_WT_RESET}\n" "branch" "commit" "path"
+  printf "  ${_WT_DIM}"
+  printf '─%.0s' {1..55}
+  printf "${_WT_RESET}\n"
+
+  local path="" hash="" branch=""
+  # $() strips trailing newlines, eating the final blank-line delimiter in the
+  # porcelain format.  Append two newlines via printf to restore it.
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) path="${line#worktree }" ;;
+      HEAD\ *)     hash="${line#HEAD }"; hash="${hash:0:7}" ;;
+      branch\ *)   branch="${line#branch refs/heads/}" ;;
+      detached)    branch="(detached)" ;;
+      bare)        branch="" ;;   # skip the bare-repo entry
+      "")
+        _wt_ls_entry "$root" "$current" "$path" "$hash" "$branch"
+        path="" hash="" branch=""
+        ;;
+    esac
+  done < <(printf '%s\n\n' "$raw")
+
+  echo
+}
+
+# ─── wt cd ─────────────────────────────────────────────────────────────────────
+
+_wt_cd() {
+  [[ $# -eq 0 ]] && { _wt_err "usage: wt cd <branch>"; return 1; }
+
+  local branch="$1"
+  local root
+  root=$(_wt_root) || return 1
+
+  local target
+  target="$root/$(_wt_dir "$branch")"
+
+  [[ -d "$target" ]] || { _wt_err "no worktree for branch '$branch'"; return 1; }
+  _wt_emit_cd "$target"
+}
+
+# ─── wt path ───────────────────────────────────────────────────────────────────
+
+# Print an absolute path on stdout (no decoration), for scripting and agents:
+#   cd "$(wt path my-branch)"
+# With no argument, prints the container root.
+_wt_path() {
+  local root
+  root=$(_wt_root) || return 1
+
+  if [[ $# -eq 0 ]]; then
+    printf '%s\n' "$root"
+    return 0
+  fi
+
+  local target="$root/$(_wt_dir "$1")"
+  [[ -d "$target" ]] || { _wt_err "no worktree for branch '$1'"; return 1; }
+  printf '%s\n' "$target"
+}
+
+# ─── wt fetch ──────────────────────────────────────────────────────────────────
+
+_wt_fetch() {
+  local root
+  root=$(_wt_root) || return 1
+  _wt_info "Fetching all remotes..."
+  git -C "$root" fetch --all
+}
+
+# ─── wt pr ─────────────────────────────────────────────────────────────────────
+
+_wt_pr() {
+  [[ $# -eq 0 ]] && { _wt_err "usage: wt pr <number>"; return 1; }
+
+  local number="$1"
+  local root
+  root=$(_wt_root) || return 1
+
+  # Use upstream (main repo) if configured, otherwise fall back to origin.
+  # GitHub exposes all PR refs on the main repo even for fork PRs.
+  local remote
+  if git -C "$root" remote get-url upstream &>/dev/null; then
+    remote="upstream"
+  else
+    remote="origin"
+  fi
+
+  local branch="pr-$number"
+  local worktree_path="$root/$branch"
+
+  [[ -d "$worktree_path" ]] && { _wt_err "worktree already exists: $worktree_path"; return 1; }
+
+  _wt_info "Fetching PR #$number from $remote..."
+  git -C "$root" fetch "$remote" "refs/pull/$number/head:$branch" || return 1
+
+  git -C "$root" worktree add "$worktree_path" "$branch" || return 1
+  _wt_ok "PR #$number -> $branch/"
+  _wt_maybe_clone_shared "$root" "$worktree_path"
+  _wt_emit_cd "$worktree_path"
+}
+
+# ─── wt prune ──────────────────────────────────────────────────────────────────
+
+_wt_prune() {
+  local root
+  root=$(_wt_root) || return 1
+  git -C "$root" worktree prune -v
+  _wt_ok "Done."
+}
+
+# ─── wt shell-init ─────────────────────────────────────────────────────────────
+
+# Print the shell wrapper.  `eval "$(wt shell-init)"` in your rc makes the
+# cd-ing subcommands change the current shell's directory.  Works in zsh & bash.
+_wt_shell_init() {
+  cat <<'WTEOF'
+wt() {
+  # Run the real `wt`, capturing only fd 3 (the cd target) while letting normal
+  # stdout/stderr pass through untouched — so `wt ls`, `wt path`, etc. still work
+  # and remain capturable/pipeable, and cd-ing commands change this shell's dir.
+  local _wt_target _wt_rc
+  { _wt_target=$(command wt "$@" 3>&1 1>&4); _wt_rc=$?; } 4>&1
+  [[ -n "$_wt_target" ]] && builtin cd -- "$_wt_target"
+  return $_wt_rc
+}
+WTEOF
+}
+
+# ─── help ──────────────────────────────────────────────────────────────────────
+
+_wt_help() {
+  printf "\n${_WT_BOLD}wt${_WT_RESET}  git worktree manager\n" >&2
+
+  printf "\n${_WT_YELLOW}SETUP${_WT_RESET}\n" >&2
+  printf "  ${_WT_CYAN}%-32s${_WT_RESET} %s\n" \
+    "wt clone <url> [dir]"       "Clone a repo into the bare+worktrees layout" \
+    "wt add-fork <url>"          "Rename origin->upstream, add fork as new origin" >&2
+
+  printf "\n${_WT_YELLOW}WORKTREES${_WT_RESET}\n" >&2
+  printf "  ${_WT_CYAN}%-32s${_WT_RESET} %s\n" \
+    "wt add <branch> [base]"     "New worktree + branch, cd in (tracks remote if found)" \
+    "wt save <branch>"           "Move uncommitted changes to a new worktree + branch, cd in" \
+    "wt rm <branch> [-d|-D]"     "Remove worktree; -d/-D also deletes the branch" \
+    "wt ls"                      "List all worktrees" \
+    "wt cd <branch>"             "Navigate to a worktree by branch name" \
+    "wt path [branch]"           "Print a worktree's absolute path (or the root)" \
+    "wt pr <number>"             "Check out a GitHub PR to a new worktree, cd in" >&2
+
+  printf "\n${_WT_YELLOW}MAINTENANCE${_WT_RESET}\n" >&2
+  printf "  ${_WT_CYAN}%-32s${_WT_RESET} %s\n" \
+    "wt fetch"                   "Fetch all remotes (works from any worktree)" \
+    "wt prune"                   "Remove stale worktree records" \
+    "wt shell-init"              "Print the shell wrapper (enables auto-cd)" >&2
+
+  printf "\n  ${_WT_DIM}Tip: add  eval \"\$(wt shell-init)\"  to your shell rc so add/cd/save/pr\n  can change your shell's directory.${_WT_RESET}\n\n" >&2
+}
+
+# ─── dispatcher ────────────────────────────────────────────────────────────────
+
+wt() {
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "$cmd" in
+    clone)             _wt_clone      "$@" ;;
+    add-fork)          _wt_add_fork   "$@" ;;
+    add)               _wt_add        "$@" ;;
+    save)              _wt_save       "$@" ;;
+    rm)                _wt_rm         "$@" ;;
+    ls)                _wt_ls         "$@" ;;
+    cd)                _wt_cd         "$@" ;;
+    path)              _wt_path       "$@" ;;
+    fetch)             _wt_fetch      "$@" ;;
+    pr)                _wt_pr         "$@" ;;
+    prune)             _wt_prune      "$@" ;;
+    shell-init)        _wt_shell_init "$@" ;;
+    ""|-h|--help|help) _wt_help ;;
+    *)                 _wt_err "unknown command: $cmd"; _wt_help; return 1 ;;
+  esac
+}
+
+wt "$@"
