@@ -148,16 +148,49 @@ _wt_add_fork() {
 
 # ─── shared-artifact cloning ───────────────────────────────────────────────────
 
+# Build (once) and return the path to a tiny helper that calls clonefile(2) on a
+# directory in a single syscall.  `cp -cR` is also copy-on-write, but its -R walk
+# issues a clonefile per file — tens of thousands of syscalls for a node_modules
+# tree, which is where the wall-clock time goes.  clonefile on the directory
+# itself clones the whole subtree at once (~7-10x faster).  Cached in XDG cache;
+# returns non-zero (so callers fall back to cp) when cc is unavailable.
+_wt_clonedir_bin() {
+  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/wt"
+  local bin="$cache/clonedir" src="$cache/clonedir.c"
+
+  [[ -x "$bin" ]] && { printf '%s' "$bin"; return 0; }
+
+  command -v cc >/dev/null 2>&1 || return 1
+  mkdir -p "$cache" 2>/dev/null || return 1
+  cat > "$src" <<'EOF'
+#include <sys/clonefile.h>
+int main(int argc, char **argv) {
+  if (argc != 3) return 2;
+  return clonefile(argv[1], argv[2], 0) == 0 ? 0 : 1;
+}
+EOF
+  cc -O2 -o "$bin" "$src" 2>/dev/null || return 1
+  printf '%s' "$bin"
+}
+
+# Copy-on-write clone a directory tree.  Prefer the single-syscall clonefile
+# helper; fall back to `cp -cR` (also CoW, just slower) when it isn't available.
+_wt_clone_dir() {
+  local src="$1" dst="$2" bin
+  bin=$(_wt_clonedir_bin) && "$bin" "$src" "$dst" 2>/dev/null && return 0
+  cp -cR "$src" "$dst" 2>/dev/null
+}
+
 # APFS-clone node_modules and .env* files from src worktree into dst worktree.
-# Uses `cp -c` (clonefile), which is macOS/APFS-only; on other filesystems the
-# clone silently fails and we skip rather than doing a slow deep copy.
+# Uses clonefile (via _wt_clone_dir) / `cp -c`, which is macOS/APFS-only; on
+# other filesystems the clone silently fails and we skip rather than deep-copy.
 _wt_clone_shared() {
   local src="$1" dst="$2"
   local cloned=0 f name
 
   if [[ -d "$src/node_modules" && ! -e "$dst/node_modules" ]]; then
     _wt_info "Cloning node_modules..."
-    if cp -cR "$src/node_modules" "$dst/node_modules" 2>/dev/null; then
+    if _wt_clone_dir "$src/node_modules" "$dst/node_modules"; then
       (( cloned++ ))
     else
       _wt_info "  (APFS clone unavailable, skipping node_modules)"
@@ -169,7 +202,7 @@ _wt_clone_shared() {
     [[ -e "$dst/$name" ]] && continue
     _wt_info "Cloning $name..."
     if [[ -d "$f" ]]; then
-      cp -cR "$f" "$dst/$name" 2>/dev/null && (( cloned++ )) || true
+      _wt_clone_dir "$f" "$dst/$name" && (( cloned++ )) || true
     else
       cp -c  "$f" "$dst/$name" 2>/dev/null && (( cloned++ )) || true
     fi
