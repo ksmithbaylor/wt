@@ -18,8 +18,10 @@ Each directory is a normal working copy on its own branch. `wt add my-feature` m
 ## Requirements
 
 - `zsh` (the script uses `#!/usr/bin/env zsh`). Your interactive shell can be zsh **or** bash — only the `wt` script itself needs zsh on the `PATH`.
-- `git` ≥ 2.32.
+- `git` ≥ **2.48**. `wt` stores worktree links as **relative paths** (via `worktree.useRelativePaths`, introduced in git 2.48) so the whole repo tree can be moved on disk without breaking. The worktree-creating commands (`clone`/`add`/`save`/`pr`) check your git version at runtime and refuse to run on anything older; read-only commands (`ls`/`cd`/`path`/`fetch`) work on any git.
 - macOS for the `node_modules` / `.env` APFS fast-clone (everything else is portable; the clone step just no-ops elsewhere).
+
+> **Moving an existing repo tree?** New clones get relative paths automatically. To convert a repo created before this (or with an older git), upgrade to git ≥ 2.48 and run once from the repo root: `git -C <repo> config worktree.useRelativePaths true && git -C <repo> worktree repair --relative-paths`.
 
 ## Install
 

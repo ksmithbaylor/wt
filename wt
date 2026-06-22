@@ -31,6 +31,32 @@ _wt_err()  { printf "${_WT_RED}error:${_WT_RESET} %s\n" "$*" >&2; }
 _wt_info() { printf "  ${_WT_DIM}%s${_WT_RESET}\n" "$*" >&2; }
 _wt_ok()   { printf "  ${_WT_GREEN}%s${_WT_RESET}\n" "$*" >&2; }
 
+# Minimum git version.  2.48 introduced relative worktree paths
+# (config worktree.useRelativePaths and `git worktree repair --relative-paths`),
+# which wt relies on so that moving a repo tree on disk doesn't break the
+# worktree links between each worktree's .git file and the bare repo.
+_WT_GIT_MIN_MAJOR=2
+_WT_GIT_MIN_MINOR=48
+
+# True if the installed git is at least $1.$2 (major.minor).
+_wt_git_ge() {
+  local v maj min
+  v=$(git version 2>/dev/null | awk '{print $3}') || return 1
+  maj=${v%%.*}; min=${v#*.}; min=${min%%.*}
+  [[ "$maj" == <-> && "$min" == <-> ]] || return 1
+  (( maj > $1 || (maj == $1 && min >= $2) ))
+}
+
+# Guard for commands that create worktree pointer files (clone/add/save/pr):
+# they must write relative paths, which needs git >= 2.48.  Read-only commands
+# (ls/cd/path/fetch/etc.) work on any git and skip this check.
+_wt_require_git() {
+  _wt_git_ge "$_WT_GIT_MIN_MAJOR" "$_WT_GIT_MIN_MINOR" && return 0
+  _wt_err "git >= ${_WT_GIT_MIN_MAJOR}.${_WT_GIT_MIN_MINOR} required (found: $(git version 2>/dev/null | awk '{print $3}'))"
+  _wt_info "wt stores worktree links as relative paths so a moved repo doesn't break; that needs git ${_WT_GIT_MIN_MAJOR}.${_WT_GIT_MIN_MINOR}+."
+  return 1
+}
+
 # Hand a destination directory to the `wt` shell wrapper via fd 3 so it can cd
 # there.  When run without the wrapper (fd 3 closed) we print a hint instead.
 _wt_emit_cd() {
@@ -97,6 +123,11 @@ _wt_clone() {
 
   # Bare clones don't configure remote tracking refs by default; fix that.
   git -C "$dir/.bare" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+
+  # Store worktree pointer files as relative paths so the whole tree can be
+  # moved on disk without breaking the links between worktrees and the bare
+  # repo.  Honored by `git worktree add` on git >= 2.48 (enforced above).
+  git -C "$dir/.bare" config worktree.useRelativePaths true
 
   _wt_info "Fetching..."
   git -C "$dir" fetch --quiet
@@ -575,16 +606,16 @@ wt() {
   local cmd="${1:-}"
   [[ $# -gt 0 ]] && shift
   case "$cmd" in
-    clone)             _wt_clone      "$@" ;;
+    clone)             _wt_require_git && _wt_clone      "$@" ;;
     add-fork)          _wt_add_fork   "$@" ;;
-    add)               _wt_add        "$@" ;;
-    save)              _wt_save       "$@" ;;
+    add)               _wt_require_git && _wt_add        "$@" ;;
+    save)              _wt_require_git && _wt_save       "$@" ;;
     rm)                _wt_rm         "$@" ;;
     ls)                _wt_ls         "$@" ;;
     cd)                _wt_cd         "$@" ;;
     path)              _wt_path       "$@" ;;
     fetch)             _wt_fetch      "$@" ;;
-    pr)                _wt_pr         "$@" ;;
+    pr)                _wt_require_git && _wt_pr         "$@" ;;
     prune)             _wt_prune      "$@" ;;
     shell-init)        _wt_shell_init "$@" ;;
     ""|-h|--help|help) _wt_help ;;
