@@ -95,35 +95,74 @@ _wt_validate_new_task() {
 }
 
 _wt_registered_path() {
-  local root="$1" expected="$2" line
+  local root="$1" expected="$2"
+  (( ${${(f)"$(_wt_worktree_paths "$root")"}[(Ie)$expected]} ))
+}
+
+_wt_worktree_paths() {
+  local root="$1" line worktree_path="" bare=""
   while IFS= read -r line; do
-    [[ "$line" == worktree\ * ]] || continue
-    [[ "${line#worktree }" == "$expected" ]] && return 0
-  done < <(git -C "$root" worktree list --porcelain)
-  return 1
+    case "$line" in
+      worktree\ *) worktree_path="${line#worktree }"; bare="" ;;
+      bare) bare=1 ;;
+      "")
+        [[ -z "$bare" && -n "$worktree_path" ]] && printf '%s\n' "$worktree_path"
+        worktree_path=""; bare=""
+        ;;
+    esac
+  done < <(git -C "$root" worktree list --porcelain; printf '\n')
+}
+
+_wt_is_external() {
+  local root="$1" worktree_path="$2"
+  [[ "$(dirname "$worktree_path")" != "$root" ]]
+}
+
+_wt_external_paths_named() {
+  local root="$1" task="$2" worktree_path
+  for worktree_path in ${(f)"$(_wt_worktree_paths "$root")"}; do
+    _wt_is_external "$root" "$worktree_path" && [[ "$(basename "$worktree_path")" == "$task" ]] &&
+      printf '%s\n' "$worktree_path"
+  done
 }
 
 _wt_task_path() {
-  local root="$1" task="$2" worktree_path="$root/$task"
-  _wt_validate_task "$task" || return 1
-  _wt_registered_path "$root" "$worktree_path" || {
-    _wt_err "no worktree for task '$task'"
-    return 1
-  }
-  printf '%s' "$worktree_path"
+  local root="$1" task="$2"
+  local -a matches
+  [[ -n "$task" && "$task" != */* ]] || { _wt_err "invalid task name: $task"; return 1; }
+  if _wt_registered_path "$root" "$root/$task"; then
+    printf '%s' "$root/$task"
+    return 0
+  fi
+
+  matches=(${(f)"$(_wt_external_paths_named "$root" "$task")"})
+  case ${#matches} in
+    0) _wt_err "no worktree for task '$task'"; return 1 ;;
+    1) printf '%s' "${matches[1]}" ;;
+    *)
+      _wt_err "task name '$task' matches several external worktrees:"
+      printf '  %s\n' "${matches[@]}" >&2
+      return 1
+      ;;
+  esac
 }
 
-_wt_current_task() {
+_wt_current_worktree() {
   local root="$1" top
-  top=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  top=$(git rev-parse --show-toplevel 2>/dev/null) && _wt_registered_path "$root" "$top" || {
     _wt_err "not inside a task worktree"
     return 1
   }
-  [[ "$(dirname "$top")" == "$root" ]] && _wt_registered_path "$root" "$top" || {
-    _wt_err "not inside a task worktree"
-    return 1
-  }
-  basename "$top"
+  printf '%s' "$top"
+}
+
+_wt_task_or_current_path() {
+  local root="$1" task="$2"
+  if [[ -n "$task" ]]; then
+    _wt_task_path "$root" "$task"
+  else
+    _wt_current_worktree "$root"
+  fi
 }
 
 _wt_source_worktree() {
@@ -452,8 +491,8 @@ _wt_finish() {
   done
 
   root=$(_wt_root) || return 1
-  [[ -n "$task" ]] || task=$(_wt_current_task "$root") || return 1
-  worktree_path=$(_wt_task_path "$root" "$task") || return 1
+  worktree_path=$(_wt_task_or_current_path "$root" "$task") || return 1
+  task=$(basename "$worktree_path")
 
   if [[ -z "$force" && -n "$(git -C "$worktree_path" status --porcelain --ignore-submodules=none 2>/dev/null)" ]]; then
     _wt_err "task '$task' has uncommitted changes; use -f to discard them"
@@ -475,9 +514,11 @@ _wt_finish() {
   remove_result=$?
   (( remove_result == 0 )) || return $remove_result
 
-  internal_ref="refs/wt/tasks/$task/base"
-  git -C "$root" update-ref -d "$internal_ref" 2>/dev/null || true
-  _wt_ok "Removed $task/. Branches were kept."
+  if ! _wt_is_external "$root" "$worktree_path"; then
+    internal_ref="refs/wt/tasks/$task/base"
+    git -C "$root" update-ref -d "$internal_ref" 2>/dev/null || true
+  fi
+  _wt_ok "Removed $worktree_path. Branches were kept."
   if [[ "$current" == "$top" || "$current" == "$top/"* ]]; then
     _wt_emit_cd "$root"
   fi
@@ -486,15 +527,29 @@ _wt_finish() {
 _wt_setup() {
   [[ "$1" == -h || "$1" == --help ]] && { _wt_help_topic setup; return; }
   local root task worktree_path
+  [[ $# -le 1 ]] || { _wt_err "usage: wt setup [<task>]"; return 1; }
   root=$(_wt_root) || return 1
-  if [[ $# -gt 0 ]]; then
-    [[ $# -eq 1 ]] || { _wt_err "usage: wt setup [<task>]"; return 1; }
-    task="$1"
-  else
-    task=$(_wt_current_task "$root") || return 1
-  fi
-  worktree_path=$(_wt_task_path "$root" "$task") || return 1
+  worktree_path=$(_wt_task_or_current_path "$root" "$1") || return 1
+  task=$(basename "$worktree_path")
   _wt_run_setup "$root" "$task" "$worktree_path"
+}
+
+_wt_describe() {
+  [[ "$1" == -h || "$1" == --help ]] && { _wt_help_topic info; return; }
+  [[ $# -le 1 ]] || { _wt_err "usage: wt info [<task>]"; return 1; }
+  local root worktree_path location checkout
+  root=$(_wt_root) || return 1
+  worktree_path=$(_wt_task_or_current_path "$root" "$1") || return 1
+  _wt_is_external "$root" "$worktree_path" && location=external || location=internal
+  checkout=$(git -C "$worktree_path" symbolic-ref --quiet --short HEAD 2>/dev/null) || checkout=detached
+
+  printf '%-9s %s\n' \
+    task "$(basename "$worktree_path")" \
+    path "$worktree_path" \
+    location "$location" \
+    checkout "$checkout" \
+    commit "$(git -C "$worktree_path" rev-parse --short HEAD 2>/dev/null)" \
+    setup "$(_wt_setup_status "$worktree_path")"
 }
 
 _wt_ls() {
@@ -595,15 +650,18 @@ _wt_ls() {
   printf "   ${_WT_DIM}"
   printf -- '-%.0s' {1..$table_width}
   printf "${_WT_RESET}\n"
+  local location_tag
   for (( index = 1; index <= ${#tasks}; index++ )); do
+    location_tag=""
+    _wt_is_external "$root" "${worktree_paths[$index]}" && location_tag="  ${_WT_YELLOW}external${_WT_RESET}"
     if (( current_rows[$index] )); then
-      printf " ${_WT_GREEN}* %-*s${_WT_RESET}  ${_WT_CYAN}%-*s${_WT_RESET}  %-*s  ${_WT_DIM}%s${_WT_RESET}\n" \
+      printf " ${_WT_GREEN}* %-*s${_WT_RESET}  ${_WT_CYAN}%-*s${_WT_RESET}  %-*s  ${_WT_DIM}%s${_WT_RESET}%s\n" \
         "$task_width" "${tasks[$index]}" "$checkout_width" "${checkouts[$index]}" \
-        "$state_width" "${states[$index]}" "${hashes[$index]:0:7}"
+        "$state_width" "${states[$index]}" "${hashes[$index]:0:7}" "$location_tag"
     else
-      printf "   ${_WT_CYAN}%-*s${_WT_RESET}  %-*s  %-*s  ${_WT_DIM}%s${_WT_RESET}\n" \
+      printf "   ${_WT_CYAN}%-*s${_WT_RESET}  %-*s  %-*s  ${_WT_DIM}%s${_WT_RESET}%s\n" \
         "$task_width" "${tasks[$index]}" "$checkout_width" "${checkouts[$index]}" \
-        "$state_width" "${states[$index]}" "${hashes[$index]:0:7}"
+        "$state_width" "${states[$index]}" "${hashes[$index]:0:7}" "$location_tag"
     fi
   done
   echo
@@ -749,7 +807,16 @@ bin/setup and configures wt.baseref and wt.setupcommand. No worktree is created.
 EOF
       ;;
     add-fork) printf '%s\n' 'usage: wt add-fork <url>' 'Rename origin to upstream, add a fork as origin, and update wt.baseref.' >&2 ;;
-    ls) printf '%s\n' 'usage: wt ls' 'List tasks, checkouts, setup/dirty state, and commits.' >&2 ;;
+    ls) printf '%s\n' 'usage: wt ls' 'List tasks, checkouts, setup/dirty state, and commits. Worktrees outside the' 'repository root are tagged "external".' >&2 ;;
+    info)
+      cat >&2 <<'EOF'
+usage: wt info [<task>]
+
+Show a task's location, checkout, commit, and setup state. Defaults to the
+current worktree. External worktrees (registered with git but living outside
+the repository root) are named by their directory's basename.
+EOF
+      ;;
     cd) printf '%s\n' 'usage: wt cd <task>' 'Navigate to a task worktree.' >&2 ;;
     path) printf '%s\n' 'usage: wt path [<task>]' 'Print a task path, or the repository root with no task.' >&2 ;;
     fetch) printf '%s\n' 'usage: wt fetch' 'Fetch all remotes.' >&2 ;;
@@ -779,6 +846,7 @@ _wt_help() {
   printf "\n${_WT_YELLOW}NAVIGATION${_WT_RESET}\n" >&2
   printf "  ${_WT_CYAN}%-48s${_WT_RESET} %s\n" \
     "wt ls"                                        "List tasks, checkouts, and state" \
+    "wt info [<task>]"                             "Show where a task lives and its state" \
     "wt cd <task>"                                 "Navigate to a task worktree" \
     "wt path [<task>]"                             "Print a task path or repository root" >&2
 
@@ -804,6 +872,7 @@ wt() {
     finish)     _wt_finish "$@" ;;
     setup)      _wt_setup "$@" ;;
     ls)         _wt_ls "$@" ;;
+    info)       _wt_describe "$@" ;;
     cd)         _wt_cd "$@" ;;
     path)       _wt_path "$@" ;;
     fetch)      _wt_fetch "$@" ;;
